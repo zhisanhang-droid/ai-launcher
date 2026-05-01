@@ -936,5 +936,6 @@ document.addEventListener('fullscreenchange',()=>setTimeout(doFit,200));
 </html>"""
 
 if __name__ == "__main__":
+    host = os.environ.get("HOST", "0.0.0.0")
     port = int(os.environ.get("PORT", 7681))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    app.run(host=host, port=port, debug=False)

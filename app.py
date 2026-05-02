@@ -1166,6 +1166,13 @@ connect();
 term.onData(d=>{ if(ws && ws.readyState===1) ws.send(d); });
 function sendKey(s){ if(ws && ws.readyState===1){ ws.send(s); term.focus(); } }
 
+// ── Copy-mode state ──────────────────────────────────────────────────────────
+let _inCopyMode = false;
+function enterCopyMode(){ _inCopyMode = true;  sendKey('\x02['); }
+function exitCopyMode(){  _inCopyMode = false; sendKey('q'); }
+function kbUp(){   sendKey(_inCopyMode ? '\x1b[A\x1b[A\x1b[A\x1b[A\x1b[A' : '\x1b[A'); }
+function kbDown(){ sendKey(_inCopyMode ? '\x1b[B\x1b[B\x1b[B\x1b[B\x1b[B' : '\x1b[B'); }
+
 // ── Keybar ───────────────────────────────────────────────────────────────────
 let _kbData = {builtins:[], hidden:[], custom:[]};
 let _kbHiddenDraft = [], _kbCustomDraft = [];
@@ -1182,13 +1189,24 @@ async function loadKeybar(){
 
 function kbScroll(n){ term.scrollLines(n); }
 
+// Map builtin IDs to special handlers (avoids quote/scope issues in onclick)
+const _kbSpecial = {
+  scroll_up:   'enterCopyMode()',
+  scroll_dn:   'exitCopyMode()',
+  arrow_up:    'kbUp()',
+  arrow_down:  'kbDown()',
+};
+
 function renderKeybar(){
   const bar = document.getElementById('keybar');
   let html = '';
   for(const b of _kbData.builtins){
     if(_kbData.hidden.includes(b.id)) continue;
     let cls = 'kbtn' + (b.id==='ctrl_c'?' kbtn-danger':'');
-    if(b.type==='scroll'){
+    const special = _kbSpecial[b.id];
+    if(special){
+      html += `<button class="${cls}" onclick="${special}">${kbEsc(b.label)}</button>`;
+    } else if(b.type==='scroll'){
       html += `<button class="${cls}" onclick="kbScroll(${b.lines})">${kbEsc(b.label)}</button>`;
     } else {
       html += `<button class="${cls}" onclick='sendKey(${JSON.stringify(b.key)})'>${kbEsc(b.label)}</button>`;
@@ -1290,13 +1308,33 @@ document.addEventListener('visibilitychange', ()=>{
 });
 
 // Resize handler: skip doFit when only height shrank (mobile keyboard popup)
+// On keyboard popup, restore viewport so content doesn't snap to bottom
 let _prevW = window.innerWidth, _prevH = window.innerHeight;
+let _savedViewportY = -1;
 function onWindowResize(){
   const w = window.innerWidth, h = window.innerHeight;
-  const keyboardPopup = (w === _prevW && (_prevH - h) > 80);
+  const keyboardPopup  = (w === _prevW && (_prevH - h) > 80);
+  const keyboardDismiss= (w === _prevW && (h - _prevH) > 80);
   _prevW = w; _prevH = h;
-  if(!keyboardPopup) doFit();
+  if(keyboardPopup){
+    // keyboard appeared: restore scroll position after layout settles
+    if(_savedViewportY >= 0){
+      const target = _savedViewportY;
+      setTimeout(()=>{
+        const buf = term.buffer.active;
+        const delta = buf.viewportY - target;
+        if(delta > 0) term.scrollLines(-delta);
+      }, 80);
+    }
+    return;
+  }
+  if(keyboardDismiss) _savedViewportY = -1;
+  doFit();
 }
+// Save viewport Y on touch (before keyboard appears)
+document.getElementById('term-wrap').addEventListener('touchstart', ()=>{
+  _savedViewportY = term.buffer.active.viewportY;
+}, {passive:true});
 window.addEventListener('resize', onWindowResize);
 
 function redraw(){

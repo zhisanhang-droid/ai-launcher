@@ -41,8 +41,6 @@ BUILTIN_KEYS = [
     {"id": "ctrl_z",      "label": "Ctrl+Z", "type": "key",    "key": "\x1a"},
     {"id": "pipe",        "label": "|",      "type": "key",    "key": "|"},
     {"id": "tilde",       "label": "~",      "type": "key",    "key": "~"},
-    {"id": "scroll_up",   "label": "回顾",   "type": "key",    "key": "\x02["},
-    {"id": "scroll_dn",   "label": "退回顾",  "type": "key",    "key": "q"},
 ]
 
 def _load_shortcuts():
@@ -236,7 +234,7 @@ def _no_cache(resp):
 @app.route("/")
 @login_required
 def index():
-    return _no_cache(app.make_response(render_template_string(INDEX_HTML, tools=TOOLS, sc_users=SC_USERS)))
+    return _no_cache(app.make_response(render_template_string(INDEX_HTML, tools=TOOLS)))
 
 @app.route("/t/<name>")
 @login_required
@@ -1331,10 +1329,11 @@ body{position:fixed;top:0;left:0;right:0;bottom:0;background:#1e1e1e;display:fle
 .hist-lines-sel{background:#3a3a3a;color:#ccc;border:1px solid #555;border-radius:6px;padding:4px 6px;font-size:12px}
 .hist-content{flex:1;overflow-y:auto;-webkit-overflow-scrolling:touch;padding:10px}
 .hist-pre{font-family:Menlo,Monaco,"Courier New",monospace;font-size:12px;line-height:1.55;color:#d4d4d4;white-space:pre-wrap;word-break:break-word;margin:0}
-.confirmbar{display:flex;background:#2a2a2a;border-bottom:1px solid #444;padding:5px 8px;gap:6px;flex-shrink:0}
-.cfbtn{flex:1;border:1px solid #555;border-radius:8px;background:#3a3a3a;color:#eee;font-size:18px;font-weight:700;padding:8px 0;cursor:pointer;user-select:none;text-align:center}
+.confirmbar{display:flex;align-items:center;background:#2a2a2a;border-bottom:1px solid #444;padding:4px 8px;gap:5px;flex-shrink:0}
+.cfbtn{width:36px;border:1px solid #555;border-radius:7px;background:#3a3a3a;color:#eee;font-size:15px;font-weight:700;padding:5px 0;cursor:pointer;user-select:none;text-align:center;flex-shrink:0}
 .cfbtn:active{background:#555}
-.cfbtn-enter{background:#1a3a1a;border-color:#4a7a4a;color:#7ecf7e}
+.cfbtn-enter{width:44px;background:#1a3a1a;border-color:#4a7a4a;color:#7ecf7e}
+#pet-canvas{margin-left:auto;display:block;image-rendering:pixelated;cursor:default}
 .theme-popup{display:none;position:fixed;top:58px;right:8px;background:#fff;border:1px solid #ddd;border-radius:12px;padding:14px;z-index:300;box-shadow:0 4px 20px rgba(0,0,0,.25);width:230px}
 .theme-popup.show{display:block}
 .theme-swatches{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}
@@ -1359,7 +1358,6 @@ body{position:fixed;top:0;left:0;right:0;bottom:0;background:#1e1e1e;display:fle
       <button class="tbtn t-new" onclick="newSame()">新建</button>
       {% endif %}
       <button class="tbtn t-fs" onclick="redraw()" style="background:#e8f5e9;color:#2e7d32">刷新</button>
-      <button class="tbtn t-fs" id="fs-btn" onclick="toggleFs()">全屏</button>
       <button class="tbtn" id="notif-btn" onclick="toggleNotif()" title="开启通知" style="background:#3a3a3a;color:#ccc">🔕</button>
       <button class="tbtn" onclick="openHistory()" style="background:#2a2a2a;color:#ccc">历史</button>
       <button class="tbtn" id="theme-btn" onclick="toggleThemePopup();event.stopPropagation()" title="背景色" style="background:#3a3a3a;color:#eee;font-size:15px;padding:6px 9px">🎨</button>
@@ -1373,6 +1371,7 @@ body{position:fixed;top:0;left:0;right:0;bottom:0;background:#1e1e1e;display:fle
   <button class="cfbtn" onclick="sendKey('2\n')">2</button>
   <button class="cfbtn" onclick="sendKey('3\n')">3</button>
   <button class="cfbtn cfbtn-enter" onclick="sendKey('\r')">↵</button>
+  <canvas id="pet-canvas" width="60" height="33"></canvas>
 </div>
 <div class="keybar" id="keybar"></div>
 <button class="follow-btn" id="follow-btn" onclick="scrollToBottom()">⬇ 跟随实时</button>
@@ -1495,7 +1494,7 @@ function connect(){
 
 connect();
 term.onData(d=>{ if(ws && ws.readyState===1) ws.send(d); });
-function sendKey(s){ if(ws && ws.readyState===1){ ws.send(s); term.focus(); } }
+function sendKey(s){ if(ws && ws.readyState===1){ ws.send(s); term.focus(); if(window._petAlert)window._petAlert(); } }
 
 // ── Copy-mode state ──────────────────────────────────────────────────────────
 let _inCopyMode = false;
@@ -1522,8 +1521,6 @@ function kbScroll(n){ term.scrollLines(n); }
 
 // Map builtin IDs to special handlers (avoids quote/scope issues in onclick)
 const _kbSpecial = {
-  scroll_up:   'enterCopyMode()',
-  scroll_dn:   'exitCopyMode()',
   arrow_up:    'kbUp()',
   arrow_down:  'kbDown()',
 };
@@ -1884,17 +1881,70 @@ async function closeAndBack(){
   await fetch('/api/close/'+SESS,{method:'POST'});
   location.href='/';
 }
-function toggleFs(){
-  const btn=document.getElementById('fs-btn');
-  if(!document.fullscreenElement){
-    document.documentElement.requestFullscreen().catch(()=>{});
-    btn.textContent='退出全屏';
-  }else{
-    document.exitFullscreen();
-    btn.textContent='全屏';
+// ── Pixel Pet (Holstein Cow) ──────────────────────────────────────────────────
+(function(){
+  const cv=document.getElementById('pet-canvas');
+  if(!cv)return;
+  const cx=cv.getContext('2d');
+  const S=3;
+  // palette: 0=transparent 1=white 2=dark 3=pink 4=tan/horn 5=hoof-gray
+  const C=[null,'#f0f0f0','#2d2d2d','#ffb3ba','#c8a057','#5a5a5a'];
+  // 20-col × 11-row pixel grid (cow facing left, tail on right)
+  const BODY=[
+    [0,4,0,4,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+    [0,4,4,4,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+    [0,1,1,1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+    [1,1,2,1,2,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0],
+    [1,1,1,3,3,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0],
+    [0,1,1,1,1,1,1,1,1,1,1,1,1,0,0,0,0,0,0,0],
+    [0,1,2,1,1,1,1,1,2,1,1,1,1,0,0,0,0,0,0,0],
+    [1,1,1,1,1,1,1,1,1,1,1,1,1,0,0,0,0,0,0,0],
+    [0,0,5,0,0,5,0,0,5,0,0,0,0,0,0,0,0,0,0,0],
+    [0,0,5,0,0,5,0,0,5,0,0,0,0,0,0,0,0,0,0,0],
+    [0,5,5,0,5,5,0,5,5,0,0,0,0,0,0,0,0,0,0,0],
+  ];
+  // tail frames: 3 positions (up / mid / down), each is an array of {r,c}
+  const TAIL=[
+    [{r:6,c:13},{r:5,c:14},{r:4,c:15}],
+    [{r:7,c:13},{r:7,c:14},{r:6,c:15}],
+    [{r:7,c:13},{r:8,c:14},{r:9,c:15}],
+  ];
+  const TSEQ=[0,1,2,1];
+  let ti=0,tacc=0,blink=false,bacc=0,bnext=3000+Math.random()*4000,alertT=0,lt=0;
+
+  function draw(){
+    cx.clearRect(0,0,cv.width,cv.height);
+    for(let r=0;r<BODY.length;r++){
+      for(let c=0;c<BODY[r].length;c++){
+        let v=BODY[r][c]; if(!v)continue;
+        if(blink&&r===3&&(c===2||c===4))v=1;
+        cx.fillStyle=C[v];
+        cx.fillRect(c*S,r*S,S,S);
+      }
+    }
+    cx.fillStyle=C[2];
+    for(const p of TAIL[TSEQ[ti]])cx.fillRect(p.c*S,p.r*S,S,S);
+    if(alertT>0){
+      cx.fillStyle='#f5c518';
+      cx.font='bold 9px sans-serif';
+      cx.textAlign='right';
+      cx.fillText('!',cv.width-1,9);
+      cx.textAlign='left';
+    }
   }
-}
-document.addEventListener('fullscreenchange',()=>setTimeout(doFit,200));
+
+  function tick(ts){
+    const dt=Math.min(ts-lt,100); lt=ts;
+    tacc+=dt; if(tacc>420){tacc=0;ti=(ti+1)%TSEQ.length;}
+    bacc+=dt;
+    if(!blink&&bacc>bnext){blink=true;bacc=0;bnext=3000+Math.random()*4000;setTimeout(()=>blink=false,140);}
+    if(alertT>0)alertT-=dt;
+    draw();
+    requestAnimationFrame(tick);
+  }
+  requestAnimationFrame(tick);
+  window._petAlert=()=>{alertT=900;};
+})();
 </script>
 </body>
 </html>"""

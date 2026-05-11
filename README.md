@@ -1,25 +1,29 @@
 # AI Launcher
 
-A lightweight, mobile-friendly web terminal launcher for running AI tools (Claude, Codex, etc.) on a remote Linux server — accessible from any phone browser.
+A mobile-friendly web terminal for running AI tools (Claude, Codex, or any CLI) on a remote Linux server — accessible from any browser, no app install required.
 
 ![Python](https://img.shields.io/badge/python-3.8%2B-blue) ![Flask](https://img.shields.io/badge/flask-sock-green) ![tmux](https://img.shields.io/badge/backend-tmux-orange)
 
 ## Why
 
-Mobile SSH apps are clunky. This gives you a clean home-screen launcher with big tap targets, a mobile-optimised xterm.js terminal, and persistent sessions via tmux — so switching apps on your phone doesn't kill your Claude conversation.
+Mobile SSH apps are clunky. AI Launcher gives you a clean home-screen launcher with big tap targets, a mobile-optimised xterm.js terminal, and persistent sessions via tmux — switching apps on your phone never kills your Claude conversation.
 
 ## Features
 
 - **Tool launcher** — one-tap buttons to start Claude, Codex, or any custom command
-- **Persistent sessions** — powered by tmux; disconnecting never kills the process
-- **Multi-session** — run several tools in parallel, switch between them via the session bar
-- **Mobile keyboard bar** — ESC, TAB, arrows, Ctrl+C/D/L/Z without a hardware keyboard
-- **Touch scroll** — swipe up/down to scroll terminal history
-- **Custom shortcuts** — save and pin your own named commands to the home screen
-- **One-shot commands** — run any ad-hoc command without creating a saved shortcut
-- **Server memory bar** — live RAM usage at a glance
-- **PWA** — add to home screen for a full-screen, app-like experience (requires HTTPS)
-- **Auto-reconnect** — WebSocket reconnects automatically when you switch back from another app
+- **Persistent tmux sessions** — close the browser; your session keeps running
+- **Multi-session** — run several tools in parallel, switch via the session bar
+- **Session rename** — tap a session label to rename it inline
+- **Dark terminal theme** — customizable background via color picker + 6 editable color swatches (saved in localStorage)
+- **Confirm row** — dedicated `1 / 2 / 3 / ↵` button row above the keybar for common prompts
+- **Mobile keybar** — ESC, TAB, arrows, Ctrl+C/D/L/Z without a hardware keyboard; add/hide keys; shortcuts persist on server
+- **History viewer** — tap the clock icon for a scrollable popup of full terminal history (up to 10 000 lines, ANSI-rendered)
+- **AI output notifications** — Web Notification + title flash when output arrives while the tab is hidden (toggle 🔕/🔔)
+- **Session export** — download terminal history as `.txt`
+- **Remote server management** — store SSH connection profiles (host, port, user, optional identity file), tap to open an SSH session
+- **Custom shortcuts** — save and pin named commands to the home screen
+- **PWA** — add to home screen for a full-screen app experience (requires HTTPS)
+- **Auto-reconnect** — WebSocket reconnects automatically when you switch back
 
 ## Requirements
 
@@ -29,59 +33,71 @@ tmux
 pip install flask flask-sock
 ```
 
-## Quick start
+## Quick Start
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/ai-launcher
+git clone https://github.com/zhisanhang-droid/ai-launcher.git
 cd ai-launcher
+pip install flask flask-sock
 
-# Set credentials via environment variables (do NOT hardcode in production)
-export ADMIN_USER=admin
-export ADMIN_PASS=your-secure-password
+# Required: set strong credentials
+export SECRET_KEY="a-long-random-string"
+export ADMIN_USER="admin"
+export ADMIN_PASS="your-secure-password"
 
 # Create data directory
 mkdir -p /opt/ai-launcher
-touch /opt/ai-launcher/sessions.json /opt/ai-launcher/shortcuts.json
 
-# Recommended: use window-size latest so tmux follows the most recent client size
+# Recommended: tmux follows latest client size
 echo 'set -g window-size latest' >> ~/.tmux.conf
 
 python3 app.py
 ```
 
-Open `http://your-server-ip:7681` in your phone browser.
+Open `http://your-server:5000` in your browser.
 
-## Configuration
+## Customizing Tools
 
-Edit the `TOOLS` list in `app.py` to define your own buttons:
+Edit the `TOOLS` list near the top of `app.py`:
 
 ```python
 TOOLS = [
-    {
-        "id":     "claude",           # unique identifier
-        "label":  "Claude",           # display name
-        "desc":   "Claude AI",        # subtitle
-        "color":  "#4f86c6",          # dot colour (any CSS colour)
-        "cmd":    "claude",           # command for a new session
-        "resume": "claude -r",        # command to resume last conversation
-        "user":   "root",             # unix user to run as
-    },
-    # Add Codex, custom scripts, etc.
+    {"id": "claude",  "label": "Claude",  "desc": "Claude AI",    "color": "#4f86c6",
+     "cmd": "claude", "resume": "claude -r", "user": "root"},
+    {"id": "codex",   "label": "Codex",   "desc": "OpenAI Codex", "color": "#e74c3c",
+     "cmd": "codex",  "resume": "codex",     "user": "root"},
+    {"id": "shell",   "label": "Shell",   "desc": "Bash shell",   "color": "#607d8b",
+     "cmd": "bash",   "resume": "bash",      "user": "root"},
 ]
 ```
 
-All config can also be set via environment variables:
+- `cmd` — command run when starting a new session
+- `resume` — command run when resuming (e.g. `claude -r` resumes the last conversation)
+- `user` — unix user to run as (`"root"` runs directly; others use `su - <user>`)
 
-| Variable         | Default                              | Description              |
-|------------------|--------------------------------------|--------------------------|
-| `ADMIN_USER`     | `admin`                              | Login username           |
-| `ADMIN_PASS`     | `changeme`                           | Login password           |
-| `SECRET_KEY`     | `change-me-in-production`            | Flask session secret     |
-| `META_FILE`      | `/opt/ai-launcher/sessions.json`     | Session metadata path    |
-| `SHORTCUTS_FILE` | `/opt/ai-launcher/shortcuts.json`    | Custom shortcuts path    |
-| `PORT`           | `7681`                               | Port to listen on        |
+To allow shortcuts to be created for additional unix users, edit `SC_USERS`:
 
-## Run as a systemd service
+```python
+SC_USERS = ["root", "alice", "bob"]
+```
+
+## Configuration
+
+All settings via environment variables:
+
+| Variable | Default | Description |
+|---|---|---|
+| `SECRET_KEY` | `change-me-in-production` | Flask session secret — **change this!** |
+| `ADMIN_USER` | `admin` | Login username |
+| `ADMIN_PASS` | `changeme` | Login password — **change this!** |
+| `META_FILE` | `/opt/ai-launcher/sessions.json` | Session metadata storage |
+| `SHORTCUTS_FILE` | `/opt/ai-launcher/shortcuts.json` | Shortcuts storage |
+| `KEYBAR_FILE` | `/opt/ai-launcher/keybar.json` | Keybar config storage |
+| `SERVERS_FILE` | `/opt/ai-launcher/servers.json` | Remote server profiles |
+| `SSHKEYS_DIR` | `/opt/ai-launcher/ssh_keys` | SSH private key storage (chmod 700) |
+| `PORT` | `5000` | Listening port |
+
+## Running as a systemd Service
 
 ```ini
 # /etc/systemd/system/ai-launcher.service
@@ -90,14 +106,14 @@ Description=AI Launcher
 After=network.target
 
 [Service]
-ExecStart=/usr/bin/python3 /opt/ai-launcher/app.py
-Environment=ADMIN_USER=admin
-Environment=ADMIN_PASS=your-secure-password
-Environment=SECRET_KEY=your-random-secret
-Restart=always
-RestartSec=3
 User=root
 WorkingDirectory=/opt/ai-launcher
+ExecStart=/usr/bin/python3 /opt/ai-launcher/app.py
+Environment=SECRET_KEY=your-random-secret
+Environment=ADMIN_USER=admin
+Environment=ADMIN_PASS=your-secure-password
+Restart=always
+RestartSec=3
 
 [Install]
 WantedBy=multi-user.target
@@ -108,13 +124,28 @@ systemctl daemon-reload
 systemctl enable --now ai-launcher
 ```
 
+## Running Behind nginx (HTTPS recommended for PWA + notifications)
+
+WebSockets require the `Upgrade` header to pass through:
+
+```nginx
+location / {
+    proxy_pass http://127.0.0.1:5000;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_set_header Host $host;
+    proxy_read_timeout 3600;
+}
+```
+
 ## Architecture
 
 ```
 Browser (xterm.js + WebSocket)
         │
         ▼
-Flask app (app.py)  ──── /api/* REST routes (sessions, shortcuts, memory)
+Flask app (app.py)  ──── /api/* REST routes (sessions, shortcuts, servers, history)
         │
         ▼  PTY (pty.openpty)
    tmux session  ──── keeps process alive across disconnects
@@ -125,17 +156,26 @@ Flask app (app.py)  ──── /api/* REST routes (sessions, shortcuts, memory
 
 Key design decisions:
 
-- **Size-first PTY**: the browser measures the terminal size *before* opening the WebSocket and passes `?cols=X&rows=Y` in the URL, so the PTY is created at the correct width from byte zero — no garbled output.
-- **`tmux resize-window`** is called after every PTY resize (TIOCSWINSZ alone is not enough for tmux).
-- **`set -g window-size latest`** in `~/.tmux.conf` makes tmux follow the most recent client's size instead of the smallest.
-- **`position:fixed` on `<body>`** locks the layout against mobile browser chrome collapsing (the "100vh issue"), keeping the toolbar always visible.
+- **Size-first PTY** — browser measures terminal size before opening the WebSocket, passes `?cols=X&rows=Y` in the URL, so the PTY is created at the correct width from byte zero
+- **`tmux resize-window`** called after every PTY resize (TIOCSWINSZ alone is not enough for tmux)
+- **`set -g window-size latest`** in `~/.tmux.conf` makes tmux follow the most recent client's size
+- **visualViewport API** for accurate mobile keyboard detection — body height tracks the visible area so the terminal never hides behind the virtual keyboard
+- **`; exec bash` appended** to all tool commands so tmux sessions persist even if the tool process exits
 
-## Security notes
+## Security Notes
 
 - This app is designed for **personal / single-user use** on a private server.
-- Always set a strong `ADMIN_PASS` via environment variable.
-- Consider putting it behind a VPN or SSH tunnel rather than exposing it to the public internet.
-- HTTPS is required for the PWA "Add to Home Screen" feature.
+- Always set strong `ADMIN_PASS` and `SECRET_KEY` via environment variables — never commit them.
+- SSH private keys are stored in `SSHKEYS_DIR` with mode 600. Keep this on local disk.
+- Consider putting the app behind a VPN or SSH tunnel rather than exposing it directly.
+- HTTPS is required for PWA "Add to Home Screen" and Web Notifications.
+
+## Mobile Tips
+
+- Add to iPhone/Android home screen for a full-screen experience.
+- The confirm row (`1 / 2 / 3 / ↵`) saves taps when responding to Claude prompts.
+- Use the history viewer (clock icon) to scroll long outputs — it renders in a native-scroll popup that doesn't fight the virtual keyboard.
+- The background color picker is in the top-right corner of the home screen.
 
 ## License
 

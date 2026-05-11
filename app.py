@@ -22,8 +22,11 @@ ADMIN_PASS = os.environ.get("ADMIN_PASS", "changeme")   # set via env var in pro
 META_FILE  = Path(os.environ.get("META_FILE", "/opt/ai-launcher/sessions.json"))
 SHORTCUTS_FILE = Path(os.environ.get("SHORTCUTS_FILE", "/opt/ai-launcher/shortcuts.json"))
 KEYBAR_FILE    = Path(os.environ.get("KEYBAR_FILE",    "/opt/ai-launcher/keybar.json"))
+SERVERS_FILE   = Path(os.environ.get("SERVERS_FILE",   "/opt/ai-launcher/servers.json"))
+SSHKEYS_DIR    = Path(os.environ.get("SSHKEYS_DIR",    "/opt/ai-launcher/ssh_keys"))
+SSHKEYS_DIR.mkdir(mode=0o700, exist_ok=True)
 SC_COLORS  = ["#e8703a","#7c6af7","#2e86de","#e74c3c","#f39c12","#8e44ad","#16a085","#d35400","#2980b9","#1abc9c"]
-SC_USERS   = ["root", "zhanghai", "mimo"]
+SC_USERS   = ["root"]
 
 BUILTIN_KEYS = [
     {"id": "esc",         "label": "ESC",    "type": "key",    "key": "\x1b"},
@@ -60,6 +63,15 @@ def _load_keybar():
 def _save_keybar(data):
     KEYBAR_FILE.write_text(json.dumps(data, indent=2, ensure_ascii=False))
 
+def _load_servers():
+    try:
+        return json.loads(SERVERS_FILE.read_text())
+    except Exception:
+        return []
+
+def _save_servers(data):
+    SERVERS_FILE.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+
 
 # ── Tool definitions ──────────────────────────────────────────────────────────────
 # Each tool appears as a button on the home screen.
@@ -67,18 +79,16 @@ def _save_keybar(data):
 # "resume" : command to attach to an existing Claude conversation (-r flag)
 # "user"   : unix user to run as (non-root uses `su - <user>`)
 TOOLS = [
-    {"id": "root-claude",     "label": "Claude · root",     "desc": "Claude AI (root)",     "color": "#4f86c6",
-     "cmd": "claude",  "resume": "claude -r", "user": "root"},
-    {"id": "zhanghai-claude", "label": "Claude · zhanghai", "desc": "Claude AI (zhanghai)", "color": "#5aaa78",
-     "cmd": "claude",  "resume": "claude -r", "user": "zhanghai"},
-    {"id": "mimo-claude",     "label": "Claude · mimo",     "desc": "Claude AI (mimo)",     "color": "#b07dc9",
-     "cmd": "claude",  "resume": "claude -r", "user": "mimo"},
-    {"id": "mimo-hermes",     "label": "Hermes · mimo",     "desc": "Hermes Agent (mimo)",  "color": "#e08c3a",
-     "cmd": "/home/mimo/.local/bin/hermes", "resume": "/home/mimo/.local/bin/hermes --continue", "user": "mimo"},
-    {"id": "codex",           "label": "Codex",             "desc": "OpenAI Codex",         "color": "#e74c3c",
-     "cmd": "/root/.nvm/versions/node/v22.22.0/bin/codex", "resume": "/root/.nvm/versions/node/v22.22.0/bin/codex", "user": "root"},
-    {"id": "shell",           "label": "终端",              "desc": "Bash shell",           "color": "#607d8b",
-     "cmd": "bash",    "resume": "bash",      "user": "root"},
+    # Add your tools here. Each entry appears as a button on the home screen.
+    # "cmd"    : command to start a new session
+    # "resume" : command to resume/continue (e.g. claude -r)
+    # "user"   : unix user to run as ("root" runs directly; others use `su - <user>`)
+    {"id": "claude",  "label": "Claude",  "desc": "Claude AI",    "color": "#4f86c6",
+     "cmd": "claude", "resume": "claude -r", "user": "root"},
+    {"id": "codex",   "label": "Codex",   "desc": "OpenAI Codex", "color": "#e74c3c",
+     "cmd": "codex",  "resume": "codex",     "user": "root"},
+    {"id": "shell",   "label": "Shell",   "desc": "Bash shell",   "color": "#607d8b",
+     "cmd": "bash",   "resume": "bash",      "user": "root"},
 ]
 TOOL_MAP = {t["id"]: t for t in TOOLS}
 
@@ -133,9 +143,10 @@ def _build_cmd(tool_id=None, resume=False, custom=None):
         return custom
     t = TOOL_MAP[tool_id]
     raw = t["resume"] if resume else t["cmd"]
+    safe = raw.replace("'", "'\\''")
     if t["user"] == "root":
-        return raw
-    return f"su - {t['user']} -c '{raw}'"
+        return f"bash -c '{safe}; exec bash'"
+    return f"su - {t['user']} -c '{safe}; exec bash'"
 
 def _create_session(label, color, cmd_str, tool_id=None, cols=80, rows=24):
     name = f"ai-{uuid.uuid4().hex[:8]}"
@@ -225,7 +236,7 @@ def _no_cache(resp):
 @app.route("/")
 @login_required
 def index():
-    return _no_cache(app.make_response(render_template_string(INDEX_HTML, tools=TOOLS)))
+    return _no_cache(app.make_response(render_template_string(INDEX_HTML, tools=TOOLS, sc_users=SC_USERS)))
 
 @app.route("/t/<name>")
 @login_required
@@ -306,6 +317,33 @@ def api_close(name):
     _save_meta(meta)
     return jsonify({"ok": True})
 
+@app.route("/api/sessions/<name>", methods=["PUT"])
+@login_required
+def api_session_update(name):
+    d = request.get_json() or {}
+    meta = _load_meta()
+    if name not in meta:
+        return jsonify({"ok": False, "error": "not found"}), 404
+    if "label" in d:
+        meta[name]["label"] = str(d["label"]).strip()[:60]
+    _save_meta(meta)
+    return jsonify({"ok": True})
+
+@app.route("/api/history/<name>")
+@login_required
+def api_history(name):
+    if name not in _tmux_sessions():
+        return jsonify({"ok": False, "error": "not found"}), 404
+    try:
+        lines = max(100, min(int(request.args.get("lines", 3000)), 10000))
+    except (ValueError, TypeError):
+        lines = 3000
+    r = subprocess.run(
+        ["tmux", "capture-pane", "-t", name, "-S", f"-{lines}", "-e", "-p"],
+        capture_output=True, text=True
+    )
+    return jsonify({"ok": True, "text": r.stdout})
+
 @app.route("/api/shortcuts", methods=["GET"])
 @login_required
 def api_shortcuts_list():
@@ -364,6 +402,80 @@ def api_shortcuts_reorder():
     reordered = [sc_map[i] for i in ids if i in sc_map]
     rest = [s for s in shortcuts if s["id"] not in {r["id"] for r in reordered}]
     _save_shortcuts(reordered + rest)
+    return jsonify({"ok": True})
+
+@app.route("/api/servers", methods=["GET"])
+@login_required
+def api_servers_list():
+    return jsonify(_load_servers())
+
+@app.route("/api/servers", methods=["POST"])
+@login_required
+def api_servers_create():
+    d = request.get_json() or {}
+    name = str(d.get("name","")).strip()[:40]
+    host = str(d.get("host","")).strip()
+    user = str(d.get("user","")).strip()
+    try:
+        port = max(1, min(int(d.get("port", 22)), 65535))
+    except (ValueError, TypeError):
+        port = 22
+    tools = [{"label": str(t.get("label",""))[:30].strip(), "cmd": str(t.get("cmd","")).strip()}
+             for t in d.get("tools", []) if str(t.get("cmd","")).strip()]
+    if not name or not host or not user:
+        return jsonify({"ok": False, "error": "name/host/user 不能为空"}), 400
+    servers = _load_servers()
+    sv = {"id": uuid.uuid4().hex[:8], "name": name, "host": host,
+          "user": user, "port": port, "tools": tools, "has_key": False,
+          "color": SC_COLORS[len(servers) % len(SC_COLORS)],
+          "created_at": int(time.time())}
+    ssh_key = str(d.get("ssh_key","")).strip()
+    if ssh_key:
+        kp = SSHKEYS_DIR / f"{sv['id']}.pem"
+        kp.write_text(ssh_key + "\n")
+        kp.chmod(0o600)
+        sv["has_key"] = True
+    servers.append(sv)
+    _save_servers(servers)
+    return jsonify({"ok": True, "server": sv})
+
+@app.route("/api/servers/<sid>", methods=["PUT"])
+@login_required
+def api_servers_update(sid):
+    d = request.get_json() or {}
+    servers = _load_servers()
+    for sv in servers:
+        if sv["id"] == sid:
+            if "name"  in d: sv["name"]  = str(d["name"]).strip()[:40]
+            if "host"  in d: sv["host"]  = str(d["host"]).strip()
+            if "user"  in d: sv["user"]  = str(d["user"]).strip()
+            if "port"  in d:
+                try: sv["port"] = max(1, min(int(d["port"]), 65535))
+                except: pass
+            if "tools" in d:
+                sv["tools"] = [{"label": str(t.get("label",""))[:30].strip(), "cmd": str(t.get("cmd","")).strip()}
+                               for t in d["tools"] if str(t.get("cmd","")).strip()]
+            ssh_key = str(d.get("ssh_key","")).strip()
+            if ssh_key:
+                kp = SSHKEYS_DIR / f"{sid}.pem"
+                kp.write_text(ssh_key + "\n")
+                kp.chmod(0o600)
+                sv["has_key"] = True
+            elif d.get("clear_key"):
+                kp = SSHKEYS_DIR / f"{sid}.pem"
+                if kp.exists(): kp.unlink()
+                sv["has_key"] = False
+            _save_servers(servers)
+            return jsonify({"ok": True})
+    return jsonify({"ok": False, "error": "not found"}), 404
+
+@app.route("/api/servers/<sid>", methods=["DELETE"])
+@login_required
+def api_servers_delete(sid):
+    servers = [s for s in _load_servers() if s["id"] != sid]
+    _save_servers(servers)
+    kp = SSHKEYS_DIR / f"{sid}.pem"
+    if kp.exists(): kp.unlink()
     return jsonify({"ok": True})
 
 @app.route("/api/keybar", methods=["GET"])
@@ -573,6 +685,16 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 .sort-arrows{display:flex;gap:4px;flex-shrink:0}
 .sort-arrows button{border:1px solid #ddd;background:#fff;border-radius:6px;padding:5px 10px;font-size:14px;cursor:pointer;line-height:1}
 .sort-arrows button:disabled{opacity:.25;cursor:default}
+.sv-tools-row{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
+.sv-tool-entry{display:flex;gap:6px;margin-bottom:8px;align-items:center}
+.sv-tool-entry .mfield{flex:1;margin-bottom:0}
+.sv-tool-del{border:none;background:#fdecea;color:#d32f2f;border-radius:6px;padding:8px 12px;cursor:pointer;font-size:13px;flex-shrink:0}
+.sv-key-box{background:#f5f5f5;border-radius:10px;padding:10px 12px;margin-bottom:12px}
+.sv-key-box textarea{width:100%;height:72px;border:1.5px solid #e5e7eb;border-radius:8px;font-size:11px;font-family:monospace;padding:8px;resize:none;box-sizing:border-box;outline:none;background:#fff}
+.sv-key-box textarea:focus{border-color:#4f86c6}
+.sv-badge{font-size:10px;background:#e8f0fe;color:#1565c0;border-radius:4px;padding:2px 6px;margin-left:4px;vertical-align:middle}
+.sv-add-tool{width:100%;padding:9px;border:1.5px dashed #ddd;background:#f9f9f9;border-radius:8px;font-size:13px;color:#666;cursor:pointer;margin-bottom:12px}
+.sv-add-tool:active{background:#eee}
 </style>
 </head>
 <body>
@@ -611,6 +733,43 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 </div>
 <div class="list" id="my-sc-list"></div>
 
+<div class="sec-hdr">
+  <span class="sec-lbl" id="s-servers">我的服务器</span>
+  <button class="sec-add" onclick="openSvModal()" id="sv-add-btn">＋ 添加</button>
+</div>
+<div class="list" id="sv-list"></div>
+
+<!-- Server modal -->
+<div class="modal" id="sv-modal" onclick="if(event.target===this)closeSvModal()">
+  <div class="mbox" style="max-height:85vh;overflow-y:auto">
+    <div class="mtitle" id="sv-modal-title">添加服务器</div>
+    <input class="mfield" id="sv-name" placeholder="名称（如：我的 VPS）">
+    <input class="mfield" id="sv-host" placeholder="服务器地址（IP 或域名）" autocomplete="off">
+    <div style="display:flex;gap:8px;margin-bottom:12px">
+      <input class="mfield" id="sv-user" placeholder="用户名（如：root）" style="flex:2;margin-bottom:0" autocomplete="off">
+      <input class="mfield" id="sv-port" placeholder="端口" value="22" style="flex:1;margin-bottom:0">
+    </div>
+    <div class="sv-key-box">
+      <div style="font-size:12px;font-weight:600;color:#555;margin-bottom:6px">SSH 私钥（选填）</div>
+      <textarea id="sv-key" placeholder="粘贴 ~/.ssh/id_rsa 内容，留空则在终端中手动认证"></textarea>
+      <div id="sv-key-hint" style="display:none;font-size:11px;color:#1565c0;margin-top:4px">已存有 SSH Key — 留空则保留原有，填写则替换</div>
+      <label style="display:flex;align-items:center;gap:6px;margin-top:6px;font-size:12px;color:#888">
+        <input type="checkbox" id="sv-clear-key"> 清除已存 SSH Key
+      </label>
+    </div>
+    <div style="font-size:12px;font-weight:600;color:#555;margin-bottom:8px">AI 工具</div>
+    <div id="sv-tools-list"></div>
+    <button class="sv-add-tool" onclick="addSvTool()">＋ 添加工具行</button>
+    <div class="mbtns">
+      <button class="mbtn mbtn-save" onclick="saveSv()" id="sv-save-btn">保存</button>
+      <button class="mbtn mbtn-cancel" onclick="closeSvModal()" id="sv-cancel-btn">取消</button>
+    </div>
+    <div id="sv-del-wrap" style="display:none">
+      <button class="mbtn mbtn-del" onclick="deleteSv()" style="width:100%;margin-top:10px">删除此服务器</button>
+    </div>
+  </div>
+</div>
+
 <div class="section" id="s-oneshot">一次性命令</div>
 <div class="oneshot-trigger">
   <button onclick="openCmdModal()" id="oneshot-btn">⌨ 输入命令并运行…</button>
@@ -647,9 +806,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
     <input class="mfield" id="sc-name" placeholder="名称（如：调研任务）">
     <input class="mfield" id="sc-cmd" placeholder="命令（如：claude）">
     <select class="mselect" id="sc-user">
-      <option value="root">root</option>
-      <option value="zhanghai">zhanghai</option>
-      <option value="mimo">mimo</option>
+      {% for u in sc_users %}<option value="{{u}}">{{u}}</option>{% endfor %}
     </select>
     <label class="mcheck-row">
       <input type="checkbox" id="sc-pinned">
@@ -979,8 +1136,123 @@ async function saveSortOrder(){
   loadShortcuts();
 }
 
+// ── Server management ─────────────────────────────────────────────────────────
+let _servers = [], _svEditId = null, _svToolDraft = [];
+
+async function loadServers(){
+  try{
+    const r = await fetch('/api/servers');
+    _servers = await r.json();
+    renderServers();
+  }catch(e){}
+}
+
+function renderServers(){
+  const el = document.getElementById('sv-list');
+  if(!_servers.length){ el.innerHTML=''; return; }
+  el.innerHTML = _servers.map(sv=>`
+    <div class="card">
+      <div class="dot" style="background:${sv.color}"></div>
+      <div class="info">
+        <div class="name">${esc(sv.name)}${sv.has_key?'<span class="sv-badge">SSH Key</span>':''}</div>
+        <div class="desc">${esc(sv.user)}@${esc(sv.host)}${sv.port!=22?':'+sv.port:''}</div>
+        ${sv.tools.length?`<div class="sv-tools-row">${sv.tools.map(t=>
+          `<button class="btn btn-primary" onclick="launchSvTool('${sv.id}',${JSON.stringify(t.cmd)},${JSON.stringify(sv.name+' · '+t.label)},'${sv.color}')">${esc(t.label)||'连接'}</button>`
+        ).join('')}</div>`:'<div class="sv-tools-row"><button class="btn btn-primary" onclick="launchSvTool(\''+sv.id+'\',\'bash\','+JSON.stringify(sv.name)+',\''+sv.color+'\')">连接 Shell</button></div>'}
+      </div>
+      <div class="actions">
+        <button class="btn btn-secondary" onclick="openSvModal('${sv.id}')">编辑</button>
+      </div>
+    </div>`).join('');
+}
+
+function openSvModal(id=null){
+  _svEditId = id;
+  const editing = !!id;
+  document.getElementById('sv-modal-title').textContent = editing?'编辑服务器':'添加服务器';
+  document.getElementById('sv-del-wrap').style.display = editing?'block':'none';
+  document.getElementById('sv-key-hint').style.display = 'none';
+  document.getElementById('sv-clear-key').checked = false;
+  if(editing){
+    const sv = _servers.find(s=>s.id===id)||{};
+    document.getElementById('sv-name').value = sv.name||'';
+    document.getElementById('sv-host').value = sv.host||'';
+    document.getElementById('sv-user').value = sv.user||'';
+    document.getElementById('sv-port').value = sv.port||22;
+    document.getElementById('sv-key').value = '';
+    document.getElementById('sv-key-hint').style.display = sv.has_key?'block':'none';
+    _svToolDraft = JSON.parse(JSON.stringify(sv.tools||[]));
+  } else {
+    document.getElementById('sv-name').value='';
+    document.getElementById('sv-host').value='';
+    document.getElementById('sv-user').value='';
+    document.getElementById('sv-port').value='22';
+    document.getElementById('sv-key').value='';
+    _svToolDraft=[];
+  }
+  renderSvTools();
+  document.getElementById('sv-modal').classList.add('show');
+  document.getElementById('sv-name').focus();
+}
+function closeSvModal(){ document.getElementById('sv-modal').classList.remove('show'); }
+
+function addSvTool(){ _svToolDraft.push({label:'',cmd:''}); renderSvTools(); }
+function removeSvTool(i){ _svToolDraft.splice(i,1); renderSvTools(); }
+function renderSvTools(){
+  const el = document.getElementById('sv-tools-list');
+  el.innerHTML = _svToolDraft.map((t,i)=>`
+    <div class="sv-tool-entry">
+      <input class="mfield" value="${esc(t.label)}" placeholder="工具名（如 Claude）"
+             oninput="_svToolDraft[${i}].label=this.value">
+      <input class="mfield" value="${esc(t.cmd)}" placeholder="命令（如 claude）"
+             oninput="_svToolDraft[${i}].cmd=this.value">
+      <button class="sv-tool-del" onclick="removeSvTool(${i})">×</button>
+    </div>`).join('');
+}
+
+async function saveSv(){
+  const name = document.getElementById('sv-name').value.trim();
+  const host = document.getElementById('sv-host').value.trim();
+  const user = document.getElementById('sv-user').value.trim();
+  const port = document.getElementById('sv-port').value.trim()||'22';
+  const ssh_key = document.getElementById('sv-key').value.trim();
+  const clear_key = document.getElementById('sv-clear-key').checked;
+  if(!name||!host||!user){ alert('名称、地址、用户名不能为空'); return; }
+  const body = {name,host,user,port:parseInt(port),tools:_svToolDraft,ssh_key,clear_key};
+  if(_svEditId){
+    await fetch('/api/servers/'+_svEditId,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  } else {
+    await fetch('/api/servers',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  }
+  closeSvModal(); loadServers();
+}
+
+async function deleteSv(){
+  if(!confirm('删除此服务器配置？')) return;
+  await fetch('/api/servers/'+_svEditId,{method:'DELETE'});
+  closeSvModal(); loadServers();
+}
+
+async function launchSvTool(svId, toolCmd, label, color){
+  const sv = _servers.find(s=>s.id===svId);
+  if(!sv) return;
+  const safe = toolCmd.replace(/'/g,"'\\''");
+  const keyFlag = sv.has_key ? `-i /opt/ai-launcher/ssh_keys/${svId}.pem ` : '';
+  const cmd = `ssh -t -p ${sv.port} ${keyFlag}-o StrictHostKeyChecking=no -o ConnectTimeout=10 ${sv.user}@${sv.host} '${safe}; exec bash'`;
+  const sz = _estSize();
+  const r = await fetch('/api/new',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({cmd,...sz})});
+  const d = await r.json();
+  if(d.ok){
+    await fetch('/api/sessions/'+d.name,{method:'PUT',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({label})});
+    location.href='/t/'+d.name;
+  } else { alert(d.error||'连接失败'); }
+}
+
 loadSessions();
 loadShortcuts();
+loadServers();
 loadMemory();
 setInterval(loadSessions,8000);
 setInterval(loadMemory,30000);
@@ -997,11 +1269,14 @@ TERMINAL_HTML = r"""<!DOCTYPE html>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 html{height:100%;overflow:hidden}
-body{position:fixed;top:0;left:0;right:0;bottom:0;background:#fafafa;display:flex;flex-direction:column;overflow:hidden}
+body{position:fixed;top:0;left:0;right:0;bottom:0;background:#1e1e1e;display:flex;flex-direction:column;overflow:hidden}
 .toolbar{background:#fff;border-bottom:1px solid #e5e7eb;padding:8px 12px;display:flex;flex-wrap:wrap;align-items:center;gap:6px;flex-shrink:0}
 .trow1{display:flex;align-items:center;gap:8px;width:100%}
 .dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
-.label{flex:1;font-size:14px;font-weight:600;color:#111;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
+.label{flex:1;font-size:14px;font-weight:600;color:#111;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0;cursor:pointer;user-select:none}
+.label:active{opacity:.6}
+.label-input{display:none;flex:1;background:transparent;border:none;border-bottom:2px solid #4f86c6;color:#111;font-size:14px;font-weight:600;outline:none;padding:2px 0;min-width:60px;max-width:200px}
+.notif-on{background:#1a3a1a!important;color:#7ecf7e!important}
 .tbtns{display:flex;gap:6px;flex-shrink:0}
 .tbtn{border:none;border-radius:8px;font-size:12px;font-weight:600;cursor:pointer;padding:6px 10px;white-space:nowrap}
 .tbtn:active{opacity:.7}
@@ -1017,10 +1292,10 @@ body{position:fixed;top:0;left:0;right:0;bottom:0;background:#fafafa;display:fle
 .kbtn{border:1px solid #ccc;border-radius:6px;background:#fff;color:#333;font-size:12px;font-weight:600;padding:5px 11px;white-space:nowrap;cursor:pointer;flex-shrink:0;user-select:none}
 .kbtn:active{background:#ddd}
 .kbtn-danger{background:#fff5f5;border-color:#f9a8a8;color:#c62828}
-.sesbar{display:flex;overflow-x:auto;background:#fafafa;border-bottom:1px solid #e8e8e8;padding:4px 8px;gap:5px;flex-shrink:0;-webkit-overflow-scrolling:touch}
+.sesbar{display:flex;overflow-x:auto;background:#252525;border-bottom:1px solid #3a3a3a;padding:4px 8px;gap:5px;flex-shrink:0;-webkit-overflow-scrolling:touch}
 .sesbar::-webkit-scrollbar{display:none}
-.seschip{display:inline-flex;align-items:center;gap:4px;padding:3px 9px;border-radius:12px;font-size:11px;font-weight:600;white-space:nowrap;cursor:pointer;border:1.5px solid #e0e0e0;background:#fff;color:#555;flex-shrink:0;user-select:none}
-.seschip.cur{border-color:var(--sc);color:var(--sc);background:#fff}
+.seschip{display:inline-flex;align-items:center;gap:4px;padding:3px 9px;border-radius:12px;font-size:11px;font-weight:600;white-space:nowrap;cursor:pointer;border:1.5px solid #555;background:#3a3a3a;color:#bbb;flex-shrink:0;user-select:none}
+.seschip.cur{border-color:var(--sc);color:var(--sc);background:#2a2a2a}
 .seschip:active{opacity:.6}
 .sesdot{width:6px;height:6px;border-radius:50%;flex-shrink:0}
 .kbtn-edit{background:#e8f0fe;border-color:#c5d8f8;color:#1565c0;margin-left:2px}
@@ -1047,13 +1322,37 @@ body{position:fixed;top:0;left:0;right:0;bottom:0;background:#fafafa;display:fle
 .mbtn{flex:1;padding:12px;border:none;border-radius:10px;font-size:14px;font-weight:600;cursor:pointer}
 .mbtn-save{background:#111;color:#fff}
 .mbtn-cancel{background:#f0f0f0;color:#555}
+.hist-modal{display:none;position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:400;flex-direction:column}
+.hist-modal.show{display:flex}
+.hist-box{background:#1a1a1a;flex:1;display:flex;flex-direction:column;overflow:hidden}
+.hist-bar{background:#252525;padding:10px 12px;display:flex;align-items:center;justify-content:space-between;flex-shrink:0;border-bottom:1px solid #3a3a3a;gap:8px}
+.hist-title{font-size:14px;font-weight:600;color:#ccc}
+.hist-close-btn{background:#444;color:#ccc;border:none;border-radius:8px;padding:6px 14px;font-size:13px;cursor:pointer;flex-shrink:0}
+.hist-lines-sel{background:#3a3a3a;color:#ccc;border:1px solid #555;border-radius:6px;padding:4px 6px;font-size:12px}
+.hist-content{flex:1;overflow-y:auto;-webkit-overflow-scrolling:touch;padding:10px}
+.hist-pre{font-family:Menlo,Monaco,"Courier New",monospace;font-size:12px;line-height:1.55;color:#d4d4d4;white-space:pre-wrap;word-break:break-word;margin:0}
+.confirmbar{display:flex;background:#2a2a2a;border-bottom:1px solid #444;padding:5px 8px;gap:6px;flex-shrink:0}
+.cfbtn{flex:1;border:1px solid #555;border-radius:8px;background:#3a3a3a;color:#eee;font-size:18px;font-weight:700;padding:8px 0;cursor:pointer;user-select:none;text-align:center}
+.cfbtn:active{background:#555}
+.cfbtn-enter{background:#1a3a1a;border-color:#4a7a4a;color:#7ecf7e}
+.theme-popup{display:none;position:fixed;top:58px;right:8px;background:#fff;border:1px solid #ddd;border-radius:12px;padding:14px;z-index:300;box-shadow:0 4px 20px rgba(0,0,0,.25);width:230px}
+.theme-popup.show{display:block}
+.theme-swatches{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}
+.swatch{width:34px;height:34px;border-radius:8px;cursor:pointer;border:2px solid transparent;flex-shrink:0;box-shadow:0 1px 3px rgba(0,0,0,.3)}
+.swatch.active,.swatch:active{border-color:#4f86c6;box-shadow:0 0 0 3px rgba(79,134,198,.35)}
+.swatch.edit-target{border-color:#f90!important;box-shadow:0 0 0 3px rgba(255,153,0,.45)!important}
+.theme-custom-row{display:flex;align-items:center;gap:10px;font-size:13px;color:#555}
+.theme-custom-row input[type=color]{width:38px;height:30px;border:1px solid #ddd;border-radius:6px;cursor:pointer;padding:1px}
 </style>
 </head>
 <body>
 <div class="toolbar">
   <div class="trow1">
     <div class="dot" style="background:{{ sess.color }}"></div>
-    <div class="label">{{ sess.label }}</div>
+    <div class="label" id="sess-label" onclick="startRename()" title="点击重命名">{{ sess.label }}</div>
+    <input class="label-input" id="label-input" maxlength="40"
+           onkeydown="if(event.key==='Enter')saveRename();else if(event.key==='Escape')cancelRename();"
+           onblur="saveRename()">
     <div class="tbtns">
       <button class="tbtn t-back" onclick="location.href='/'">主页</button>
       {% if tool and tool.id %}
@@ -1061,11 +1360,20 @@ body{position:fixed;top:0;left:0;right:0;bottom:0;background:#fafafa;display:fle
       {% endif %}
       <button class="tbtn t-fs" onclick="redraw()" style="background:#e8f5e9;color:#2e7d32">刷新</button>
       <button class="tbtn t-fs" id="fs-btn" onclick="toggleFs()">全屏</button>
+      <button class="tbtn" id="notif-btn" onclick="toggleNotif()" title="开启通知" style="background:#3a3a3a;color:#ccc">🔕</button>
+      <button class="tbtn" onclick="openHistory()" style="background:#2a2a2a;color:#ccc">历史</button>
+      <button class="tbtn" id="theme-btn" onclick="toggleThemePopup();event.stopPropagation()" title="背景色" style="background:#3a3a3a;color:#eee;font-size:15px;padding:6px 9px">🎨</button>
       <button class="tbtn t-close" onclick="closeAndBack()">关闭</button>
     </div>
   </div>
 </div>
 <div class="sesbar" id="sesbar"></div>
+<div class="confirmbar">
+  <button class="cfbtn" onclick="sendKey('1\n')">1</button>
+  <button class="cfbtn" onclick="sendKey('2\n')">2</button>
+  <button class="cfbtn" onclick="sendKey('3\n')">3</button>
+  <button class="cfbtn cfbtn-enter" onclick="sendKey('\r')">↵</button>
+</div>
 <div class="keybar" id="keybar"></div>
 <button class="follow-btn" id="follow-btn" onclick="scrollToBottom()">⬇ 跟随实时</button>
 
@@ -1089,6 +1397,40 @@ body{position:fixed;top:0;left:0;right:0;bottom:0;background:#fafafa;display:fle
   </div>
 </div>
 
+<!-- History viewer modal -->
+<div class="hist-modal" id="hist-modal">
+  <div class="hist-box">
+    <div class="hist-bar">
+      <span class="hist-title">历史记录</span>
+      <select class="hist-lines-sel" id="hist-lines" onchange="loadHistory()">
+        <option value="500">近 500 行</option>
+        <option value="1500" selected>近 1500 行</option>
+        <option value="3000">近 3000 行</option>
+        <option value="5000">近 5000 行</option>
+      </select>
+      <button class="hist-close-btn" onclick="exportHistory()" style="background:#1a3a2a;color:#7ecf7e">导出</button>
+      <button class="hist-close-btn" onclick="closeHistory()">关闭</button>
+    </div>
+    <div class="hist-content" id="hist-content">
+      <div style="color:#555;text-align:center;padding:40px 0">加载中…</div>
+    </div>
+  </div>
+</div>
+
+<!-- Theme / background color popup -->
+<div class="theme-popup" id="theme-popup" onclick="event.stopPropagation()">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+    <span style="font-size:13px;font-weight:600;color:#333">终端背景色</span>
+    <button id="swatch-edit-btn" onclick="toggleSwatchEdit()" style="font-size:11px;padding:3px 8px;border:1px solid #ccc;border-radius:6px;cursor:pointer;background:#f5f5f5;color:#555;white-space:nowrap">✏ 编辑色块</button>
+  </div>
+  <div id="edit-hint" style="display:none;font-size:11px;color:#888;margin-bottom:6px">点色块选中（橙框），再用取色器修改颜色</div>
+  <div class="theme-swatches" id="swatch-container"></div>
+  <div class="theme-custom-row">
+    <span>取色:</span>
+    <input type="color" id="custom-bg-picker" value="#1e1e1e" oninput="onPickerInput(this.value)">
+  </div>
+</div>
+
 <div id="term-wrap"></div>
 
 <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js"></script>
@@ -1099,34 +1441,23 @@ const TOOL = "{{ tool.id if tool and tool.id else '' }}";
 
 const term = new Terminal({
   theme:{
-    background:'#fafafa',foreground:'#1a1a1a',cursor:'#444',cursorAccent:'#fafafa',
-    selectionBackground:'#b3d4fd',
-    black:'#2e2e2e',red:'#c0392b',green:'#27ae60',yellow:'#d68910',
-    blue:'#1a5276',magenta:'#6c3483',cyan:'#0e6655',white:'#ecf0f1',
-    brightBlack:'#7f8c8d',brightRed:'#e74c3c',brightGreen:'#2ecc71',brightYellow:'#f1c40f',
-    brightBlue:'#2980b9',brightMagenta:'#9b59b6',brightCyan:'#1abc9c',brightWhite:'#ffffff',
+    background:'#1e1e1e',foreground:'#d4d4d4',cursor:'#d4d4d4',cursorAccent:'#1e1e1e',
+    selectionBackground:'#264f78',
+    black:'#1e1e1e',red:'#f44747',green:'#4ec9b0',yellow:'#dcdcaa',
+    blue:'#569cd6',magenta:'#c678dd',cyan:'#4ec9b0',white:'#d4d4d4',
+    brightBlack:'#858585',brightRed:'#f44747',brightGreen:'#4ec9b0',brightYellow:'#dcdcaa',
+    brightBlue:'#569cd6',brightMagenta:'#c678dd',brightCyan:'#4ec9b0',brightWhite:'#ffffff',
   },
   fontFamily:'Menlo,Monaco,"Courier New",monospace',
   fontSize:14,lineHeight:1.3,
   scrollback:3000,cursorBlink:true,allowTransparency:false,
-  scrollOnUserInput:false,
+  scrollOnUserInput:true,
 });
 
 const fitAddon = new FitAddon.FitAddon();
 term.loadAddon(fitAddon);
 term.open(document.getElementById('term-wrap'));
 
-// Touch scroll: swipe up/down to scroll terminal history
-(function(){
-  const el = document.getElementById('term-wrap');
-  let startY = 0;
-  el.addEventListener('touchstart', e => { startY = e.touches[0].clientY; }, {passive:true});
-  el.addEventListener('touchmove', e => {
-    const dy = startY - e.touches[0].clientY;
-    startY = e.touches[0].clientY;
-    if(Math.abs(dy) > 1){ term.scrollLines(Math.round(dy / 2)); e.preventDefault(); }
-  }, {passive:false});
-})();
 
 // Follow-bottom button: show when user has scrolled up
 term.onScroll(() => {
@@ -1154,7 +1485,7 @@ function connect(){
     term.write('\x1b[2K\r');
     setTimeout(()=>{ doFit(); ws.send('\x0c'); }, 400);
   };
-  ws.onmessage = e=>{ term.write(e.data); };
+  ws.onmessage = e=>{ term.write(e.data); _onOutput(); };
   ws.onclose = ()=>{
     term.write('\r\n\x1b[33m[Disconnected — reconnecting in 2s...]\x1b[0m');
     reconnTimer = setTimeout(connect, 2000);
@@ -1274,6 +1605,219 @@ async function saveKb(){
   renderKeybar();
 }
 
+// ── Session rename ────────────────────────────────────────────────────────────
+let _renaming = false;
+function startRename(){
+  if(_renaming) return;
+  _renaming = true;
+  const lbl = document.getElementById('sess-label');
+  const inp = document.getElementById('label-input');
+  inp.value = lbl.textContent.trim();
+  lbl.style.display = 'none';
+  inp.style.display = 'block';
+  inp.focus(); inp.select();
+}
+async function saveRename(){
+  if(!_renaming) return;
+  _renaming = false;
+  const lbl = document.getElementById('sess-label');
+  const inp = document.getElementById('label-input');
+  const v = inp.value.trim() || lbl.textContent.trim();
+  inp.style.display = 'none';
+  lbl.style.display = '';
+  lbl.textContent = v;
+  document.title = v;
+  await fetch(`/api/sessions/${SESS}`, {method:'PUT',
+    headers:{'Content-Type':'application/json'}, body:JSON.stringify({label:v})});
+}
+function cancelRename(){
+  if(!_renaming) return;
+  _renaming = false;
+  document.getElementById('label-input').style.display = 'none';
+  document.getElementById('sess-label').style.display = '';
+}
+
+// ── Output notifications ──────────────────────────────────────────────────────
+let _unread = false, _notifEnabled = false;
+const _origTitle = document.title;
+function _updateNotifBtn(){
+  const btn = document.getElementById('notif-btn');
+  if(!btn) return;
+  btn.textContent = _notifEnabled ? '🔔' : '🔕';
+  btn.title = _notifEnabled ? '通知已开启（点击关闭）' : '开启通知';
+  btn.classList.toggle('notif-on', _notifEnabled);
+}
+async function toggleNotif(){
+  if(_notifEnabled){
+    _notifEnabled = false; localStorage.setItem('notif','0'); _updateNotifBtn(); return;
+  }
+  if(!('Notification' in window)){ alert('此浏览器不支持系统通知'); return; }
+  const p = await Notification.requestPermission();
+  _notifEnabled = (p === 'granted');
+  localStorage.setItem('notif', _notifEnabled?'1':'0');
+  _updateNotifBtn();
+  if(!_notifEnabled) alert('请在浏览器设置中允许通知权限');
+}
+function _onOutput(){
+  if(!document.hidden) return;
+  if(!_unread){ _unread = true; document.title = '⚡ ' + _origTitle; }
+  if(_notifEnabled && Notification.permission==='granted'){
+    new Notification('AI 工作台有新输出', {
+      body: document.getElementById('sess-label')?.textContent || SESS,
+      icon: '/static/icon.svg', tag:'ai-out', silent:true,
+    });
+  }
+}
+document.addEventListener('visibilitychange', ()=>{
+  if(!document.hidden && _unread){ _unread=false; document.title=_origTitle; }
+});
+_notifEnabled = localStorage.getItem('notif')==='1' && Notification.permission==='granted';
+_updateNotifBtn();
+
+// ── Export history ────────────────────────────────────────────────────────────
+async function exportHistory(){
+  const lines = document.getElementById('hist-lines')?.value || 5000;
+  try{
+    const r = await fetch(`/api/history/${SESS}?lines=${lines}`);
+    const d = await r.json();
+    if(!d.ok){ alert('导出失败'); return; }
+    const plain = d.text.replace(/\x1b\[[0-9;]*[A-Za-z]/g,'').replace(/\x1b[^\x1b]*/g,'');
+    const blob = new Blob([plain], {type:'text/plain;charset=utf-8'});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    const label = (document.getElementById('sess-label')?.textContent||'session').trim().replace(/[/\\:*?"<>|]/g,'-');
+    const dt = new Date().toISOString().slice(0,16).replace('T','_').replace(':','-');
+    a.href=url; a.download=`${label}_${dt}.txt`;
+    document.body.appendChild(a); a.click();
+    document.body.removeChild(a); URL.revokeObjectURL(url);
+  }catch(e){ alert('导出失败'); }
+}
+
+// ── History viewer ────────────────────────────────────────────────────────────
+function _ansiToHtml(raw){
+  const clean=raw
+    .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g,'')
+    .replace(/\x1b\[[0-9;]*[ABCDEFGHIJKLMPSTXZnsu]/g,'')
+    .replace(/\x1b[()[B][AB012]/g,'')
+    .replace(/\x1b[^[\]()m]/g,'');
+  const FG={30:'#858585',31:'#f44747',32:'#4ec9b0',33:'#dcdcaa',
+            34:'#569cd6',35:'#c678dd',36:'#4ec9b0',37:'#d4d4d4',
+            90:'#858585',91:'#f44747',92:'#4ec9b0',93:'#dcdcaa',
+            94:'#569cd6',95:'#c678dd',96:'#4ec9b0',97:'#fff'};
+  const BG={40:'#000',41:'#5a0000',42:'#005a00',43:'#5a5a00',
+            44:'#00005a',45:'#5a005a',46:'#005a5a',47:'#d4d4d4'};
+  let fg='',bg='',bold=false,out='',sp=false;
+  const x=s=>s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  const cls=()=>{if(sp){out+='</span>';sp=false;}};
+  const opn=()=>{const s=(fg?`color:${fg};`:'')+( bg?`background:${bg};`:'')+( bold?'font-weight:700;':'');if(s){out+=`<span style="${s}">`;sp=true;}};
+  const parts=clean.split(/\x1b\[([0-9;]*)m/);
+  for(let i=0;i<parts.length;i++){
+    if(i%2===0){if(parts[i])out+=x(parts[i]);}
+    else{
+      cls();
+      for(const c of(parts[i]||'0').split(';').map(Number)){
+        if(c===0){fg='';bg='';bold=false;}
+        else if(c===1)bold=true;else if(c===22)bold=false;
+        else if(FG[c])fg=FG[c];else if(BG[c])bg=BG[c];
+        else if(c===39)fg='';else if(c===49)bg='';
+      }
+      opn();
+    }
+  }
+  cls(); return out;
+}
+async function loadHistory(){
+  const lines=document.getElementById('hist-lines').value;
+  document.getElementById('hist-content').innerHTML='<div style="color:#555;text-align:center;padding:40px 0">加载中…</div>';
+  try{
+    const r=await fetch(`/api/history/${SESS}?lines=${lines}`);
+    const d=await r.json();
+    if(!d.ok){document.getElementById('hist-content').innerHTML='<div style="color:#f44;padding:20px">加载失败</div>';return;}
+    const pre=document.createElement('pre');
+    pre.className='hist-pre';
+    pre.innerHTML=_ansiToHtml(d.text);
+    const box=document.getElementById('hist-content');
+    box.innerHTML=''; box.appendChild(pre);
+    box.scrollTop=box.scrollHeight;
+  }catch(e){document.getElementById('hist-content').innerHTML='<div style="color:#f44;padding:20px">加载失败</div>';}
+}
+function openHistory(){ document.getElementById('hist-modal').classList.add('show'); loadHistory(); }
+function closeHistory(){ document.getElementById('hist-modal').classList.remove('show'); }
+
+// ── Background color picker ──────────────────────────────────────────────────
+const _DEFAULT_SWATCHES = ['#1e1e1e','#0a192f','#2d1b69','#0d3b00','#3b0000','#1a1200'];
+let _swatches = (()=>{ try{ return JSON.parse(localStorage.getItem('term_swatches'))||_DEFAULT_SWATCHES; }catch(e){ return [..._DEFAULT_SWATCHES]; } })();
+let _swatchEditMode=false, _swatchEditIdx=-1, _savedBg='#1e1e1e';
+
+function _saveSwatches(){ localStorage.setItem('term_swatches', JSON.stringify(_swatches)); }
+
+function renderSwatches(){
+  const c = document.getElementById('swatch-container');
+  if(!c) return;
+  c.innerHTML = _swatches.map((col,i)=>{
+    let cls = 'swatch';
+    if(col===_savedBg) cls+=' active';
+    if(_swatchEditMode && i===_swatchEditIdx) cls+=' edit-target';
+    return `<div class="${cls}" data-color="${col}" style="background:${col}" onclick="swatchClick(${i})" title="${col}"></div>`;
+  }).join('');
+}
+
+function swatchClick(i){
+  if(_swatchEditMode){
+    _swatchEditIdx = i;
+    document.getElementById('custom-bg-picker').value = _swatches[i];
+    renderSwatches();
+  } else {
+    applyBg(_swatches[i]);
+  }
+}
+
+function toggleSwatchEdit(){
+  _swatchEditMode = !_swatchEditMode;
+  _swatchEditIdx = -1;
+  const btn = document.getElementById('swatch-edit-btn');
+  btn.textContent = _swatchEditMode ? '完成' : '✏ 编辑色块';
+  btn.style.background = _swatchEditMode ? '#4f86c6' : '#f5f5f5';
+  btn.style.color = _swatchEditMode ? '#fff' : '#555';
+  document.getElementById('edit-hint').style.display = _swatchEditMode ? 'block' : 'none';
+  renderSwatches();
+}
+
+function onPickerInput(color){
+  if(_swatchEditMode && _swatchEditIdx >= 0){
+    _swatches[_swatchEditIdx] = color;
+    _saveSwatches();
+    renderSwatches();
+  }
+  applyBg(color);
+}
+
+function applyBg(color){
+  _savedBg = color;
+  localStorage.setItem('term_bg', color);
+  const picker = document.getElementById('custom-bg-picker');
+  if(picker) picker.value = color;
+  renderSwatches();
+  term.options.theme = {...(term.options.theme||{}), background:color, cursorAccent:color};
+  document.body.style.background = color;
+  document.getElementById('term-wrap').style.background = color;
+  term.refresh(0, term.rows-1);
+}
+
+function toggleThemePopup(){
+  renderSwatches();
+  document.getElementById('theme-popup').classList.toggle('show');
+}
+document.addEventListener('click', ()=>{
+  const p = document.getElementById('theme-popup');
+  if(p) p.classList.remove('show');
+});
+(function(){
+  const saved = localStorage.getItem('term_bg') || '#1e1e1e';
+  renderSwatches();
+  setTimeout(()=>applyBg(saved), 300);
+})();
+
 loadKeybar();
 
 // ── Session switcher bar ─────────────────────────────────────────────────────
@@ -1307,35 +1851,19 @@ document.addEventListener('visibilitychange', ()=>{
   }
 });
 
-// Resize handler: skip doFit when only height shrank (mobile keyboard popup)
-// On keyboard popup, restore viewport so content doesn't snap to bottom
-let _prevW = window.innerWidth, _prevH = window.innerHeight;
-let _savedViewportY = -1;
-function onWindowResize(){
-  const w = window.innerWidth, h = window.innerHeight;
-  const keyboardPopup  = (w === _prevW && (_prevH - h) > 80);
-  const keyboardDismiss= (w === _prevW && (h - _prevH) > 80);
-  _prevW = w; _prevH = h;
-  if(keyboardPopup){
-    // keyboard appeared: restore scroll position after layout settles
-    if(_savedViewportY >= 0){
-      const target = _savedViewportY;
-      setTimeout(()=>{
-        const buf = term.buffer.active;
-        const delta = buf.viewportY - target;
-        if(delta > 0) term.scrollLines(-delta);
-      }, 80);
-    }
-    return;
-  }
-  if(keyboardDismiss) _savedViewportY = -1;
+// Resize handler: use visualViewport API to correctly handle mobile keyboard
+function _applyViewport(){
+  const vvh = window.visualViewport ? window.visualViewport.height : window.innerHeight;
+  document.body.style.height = vvh + 'px';
   doFit();
+  setTimeout(()=>term.scrollToBottom(), 100);
 }
-// Save viewport Y on touch (before keyboard appears)
-document.getElementById('term-wrap').addEventListener('touchstart', ()=>{
-  _savedViewportY = term.buffer.active.viewportY;
-}, {passive:true});
-window.addEventListener('resize', onWindowResize);
+_applyViewport();
+if(window.visualViewport){
+  window.visualViewport.addEventListener('resize', _applyViewport);
+} else {
+  window.addEventListener('resize', ()=>{ doFit(); setTimeout(()=>term.scrollToBottom(),100); });
+}
 
 function redraw(){
   doFit();
